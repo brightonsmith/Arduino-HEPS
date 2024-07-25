@@ -15,7 +15,7 @@
 #define ONE_WIRE_1 32 // Battery therm
 #define SERVO_PIN 25 
 #define GPIO_0 0
-#define GPIO_35 35
+// #define GPIO_35 35
 
 // Function declarations
 void IRAM_ATTR isr();
@@ -59,6 +59,10 @@ volatile bool isPaused = true; // Interrupt status
 volatile unsigned long button_time = 0;
 volatile unsigned long last_button_time = 0;
 
+// Initialize variables for battery voltage simulation
+float busVoltage2 = 0.0; // Simulated battery voltage
+bool firstRun = true;    // Flag to initialize battery voltage on first run
+
 ///////////////////////////////////////////////////////////////////////////////////////// Setup ////////////////////////////////////////////////////////////////////////////////////////////
 // For internal RAM execution
 void IRAM_ATTR isr() {
@@ -90,9 +94,9 @@ void setup_display() {
   // tft.fillScreen(TFT_BLACK);
 
   pinMode(GPIO_0, INPUT_PULLUP); // GPIO 0
-  pinMode(GPIO_35, INPUT_PULLUP); // GPIO 35
+  // pinMode(GPIO_35, INPUT_PULLUP); // GPIO 35
   attachInterrupt(GPIO_0, isr, FALLING);
-  attachInterrupt(GPIO_35, isr, FALLING);
+  // attachInterrupt(GPIO_35, isr, FALLING);
 }
 
 // MQTT callback function
@@ -279,23 +283,24 @@ void clear_memory(String sensor_type) {
 // Setup INA sensors
 void setup_INA() {
   // INA1 with address 0x40 (A0 = GND, A1 = GND)
-  if (!INA1.begin(0x41)) {
+  if (!INA1.begin(0x40)) {
       Serial.println("Alternator INA not found, check wiring, address, sensor ID!");
       while (1) delay(10);
   } 
-  // INA2 with address 0x41 (A0 = VCC, A1 = GND)
-  if (!INA2.begin(0x40)) {
-      Serial.println("Battery INA not found, check wiring, address, sensor ID!");
-      while (1) delay(10);
-  }
+
+  // // INA2 with address 0x41 (A0 = VCC, A1 = GND)
+  // if (!INA2.begin(0x40)) {
+  //     Serial.println("Battery INA not found, check wiring, address, sensor ID!");
+  //     while (1) delay(10);
+  // }
 
   INA1.setShunt(0.1, 1.0);
-  INA2.setShunt(0.1, 1.0);
+  // INA2.setShunt(0.1, 1.0);
 
   INA1.setAveragingCount(INA228_COUNT_16);
-  INA2.setAveragingCount(INA228_COUNT_16);
+  // INA2.setAveragingCount(INA228_COUNT_16);
 
-  Serial.println("Both INAs found and initialized!");
+  Serial.println("Alternator INA found and initialized!");
 }
 
 // Setup thermistors
@@ -385,43 +390,60 @@ void setup() {
 ////////////////////////////////////////////////////////////////////////////////////////Loop/////////////////////////////////////////////////////////////////////////////////////////////////
 // Read INA sensors
 void read_INA() {
-  // tft.print("Reading INA data...");
-
+  // Read alternator voltage
   float busVoltage1 = INA1.readBusVoltage() / 1000.0; 
-  float busVoltage2 = INA2.readBusVoltage() / 1000.0;
+
+  // Initialize the battery voltage within 0.5 V of the alternator's voltage on first run
+  if (firstRun) {
+    busVoltage2 = busVoltage1 + random(-5, 6) / 10.0; // Random initial difference between -0.5 and +0.5 V
+    firstRun = false; // Set the flag to false after initialization
+  }
+
+  // Calculate voltage difference
+  float voltageDifference = busVoltage1 - busVoltage2;
+
+  // Determine how much to adjust the battery voltage based on the voltage difference
+  // The adjustment factor determines how responsive the battery voltage is to changes in alternator voltage
+  float adjustmentFactor = 0.02; // Adjust this factor for more or less responsiveness
+  float adjustment = adjustmentFactor * voltageDifference;
+
+  // Adjust the battery voltage, ensuring it remains within the specified range and within ±1 V of the alternator voltage
+  busVoltage2 += adjustment;
+  busVoltage2 = constrain(busVoltage2, max(12.5, busVoltage1 - 1.0), min(14.4, busVoltage1 + 1.0));
+
+  // Output the simulated voltages to the Serial Monitor
   Serial.print("Alternator voltage: ");
   Serial.print(busVoltage1);
   Serial.println(" V");
+
   Serial.print("Battery voltage: ");
   Serial.print(busVoltage2);
   Serial.println(" V");
 
-  // Manually construct the JSON payload
+  // Manually construct the JSON payload for MQTT
   char payload[512];
   snprintf(payload, sizeof(payload),
-    "{\"voltageAlt\":%f,\"voltageBat\":%f}",
+    "{\"voltageAlt\":%.2f,\"voltageBat\":%.2f}",
     busVoltage1, busVoltage2);
 
-  //Serial.println(payload); // Print the payload to Serial for debugging
-  String INA_topic = parent_topic + "INA";
+  // Print the payload to Serial for debugging
+  // Serial.println(payload);
 
+  // Define the MQTT topic and publish the payload
+  String INA_topic = parent_topic + "INA";
   client.publish(INA_topic.c_str(), payload);
 
-  // tft.println("Published!");
-
-  //delay(100);
-
-  // Calculate the elapsed time in seconds
+  // Calculate the elapsed time in seconds for data logging
   unsigned long currentTime = millis();
   float elapsedTime = (currentTime - startTime) / 1000.0; // Convert milliseconds to seconds
 
-  // Save data to CSV file
+  // Save data to CSV file on SPIFFS
   fs::File file = SPIFFS.open("/INA.csv", FILE_APPEND);
   if(!file) {
     Serial.println("Failed to open file for appending");
     return;
   }
-  file.printf("%f,%f\n", 
+  file.printf("%.2f,%.2f,%.2f\n", 
               elapsedTime, busVoltage1, busVoltage2);
   file.close();
 }
