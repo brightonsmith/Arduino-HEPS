@@ -17,6 +17,8 @@
 #define GPIO_0 0
 // #define GPIO_35 35
 
+int pos = 0; 
+
 // Function declarations
 void IRAM_ATTR isr();
 
@@ -329,8 +331,18 @@ void setup_servo() {
   servo.setPeriodHertz(50);
   servo.attach(SERVO_PIN, 1000, 2000);
   
-  int initialPosition = 0; // Example initial position
-  servo.write(initialPosition);
+  // int initialPosition = 180; // Example initial position
+  // servo.write(initialPosition);
+
+  for (pos = 0; pos <= 180; pos += 1) { // goes from 0 degrees to 180 degrees
+		// in steps of 1 degree
+		servo.write(pos);    // tell servo to go to position in variable 'pos'
+		delay(15);             // waits 15ms for the servo to reach the position
+	}
+	for (pos = 180; pos >= 0; pos -= 1) { // goes from 180 degrees to 0 degrees
+		servo.write(pos);    // tell servo to go to position in variable 'pos'
+		delay(15);             // waits 15ms for the servo to reach the position
+	}
   
   // tft.setTextColor(TFT_WHITE);
   // tft.println("Servo initialized!");
