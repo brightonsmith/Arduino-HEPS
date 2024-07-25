@@ -1,45 +1,60 @@
-// #include <TFT_eSPI.h>
-#include <Wire.h>
+/*
+Arduino/ESP 32 code for an HiL demo. This demo simulates a battery being recharged by a variable power supply and discharging into an arbitrary load. 
+Voltage and temperature sensor data is read in by the ESP 32 and published to an MQTT broker (EMQX in this case).
+The output of the system is a servo acting as a simulated engine throttle (for instance, if the variable power supply was replaced by an engine with an alternator, 
+the servo would be used for adjusting the throttle of the engine and thus the voltage of the alternator.)
+
+Hardware: 
+- ESP 32 (Wroom, LilyGO T-Display, etc.) -> connects to all electronics
+- One or Two INA 228 voltage sensors -> connected to ESP 32 and reading real voltage values from the power supply or the power supply AND battery
+- One DS18B20 temperature probe -> connected to ESP 32 and reading temperature values from the battery (or whatever else)
+- One MG90S servo (or comparable servo) -> connected to ESP 32 and adjusting position based on values read in from MQTT server
+
+If using LilyGO T-Display, uncomment `// #include <TFT_eSPI.h>` as well as all `tft` lines to use the LCD display.
+
+If using one INA 228 voltage sensor, additional voltage values will be simulated to act as a battery being discharged or charged, corresponding to the power supply.
+If using two INA 228 voltage sensors, uncomment all `INA2` lines. One INA 228 will be connected to power supply, the other to a battery. 
+*/
+
+// #include <TFT_eSPI.h> // For LCD Display. Make sure to appropriately configure `Arduino/libraries/TFT_eSPI/User_Setup_Select.h` depending on the T-Display version
+#include <Wire.h> // For I2C communication
 #include <WiFi.h>
-#include <PubSubClient.h>
-#include <Adafruit_INA228.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
-#include <ArduinoJson.h>
-#include <math.h>
-#include <SPIFFS.h>
-#include <ESP32Servo.h>
+#include <PubSubClient.h> // For MQTT connection
+#include <Adafruit_INA228.h> // Voltage sensor(s)
+#include <OneWire.h> // Temperature probe
+#include <DallasTemperature.h> // Temperature probe
+#include <ArduinoJson.h> // Parsing JSON data (such as JSON data taken from an MQTT server)
+#include <math.h> // Good to include
+#include <SPIFFS.h> // For saving data to local ESP 32 memory
+#include <ESP32Servo.h> // Must use this library for servo control
 
 ///////////////////////////////////////////////////////////////////////////// Config and Globals ////////////////////////////////////////////////////////////////////////////////////////////
 // Pins
 #define ONE_WIRE_1 32 // Battery therm
-#define SERVO_PIN 25 
-#define GPIO_0 0
-// #define GPIO_35 35
-
-int pos = 0; 
+#define SERVO_PIN 25 // Servo
+#define GPIO_0 0 // Interrupt (`BOOT` button on Wroom ESP 32)
 
 // Function declarations
 void IRAM_ATTR isr();
 
 // WiFi credentials
-const char *ssid = "Crazy Frog"; // Set by user
-const char *password = "Stravinsky1913"; // Set by user
+const char *ssid = "your_SSID"; // Set by user
+const char *password = "your_PASSWORD"; // Set by user
 
 // MQTT Broker details
-const char *mqtt_broker = "broker.emqx.io";
-String parent_topic = "weedeater_esp32/";
-const int mqtt_port = 1883;
+const char *mqtt_broker = "broker.emqx.io"; // Free public broker
+String parent_topic = "parent/"; // Each piece of data published will use this prefix before the data-specific name (i.e. "parent/servo")
+const int mqtt_port = 1883; // Unsecure port
 String subscribe_topic = parent_topic + "servo";
 
-WiFiClient espClient;
+WiFiClient espClient; 
 PubSubClient client(espClient);
 
 // TFT_eSPI tft = TFT_eSPI(); // TFT display instance
 
 // Sensors
 // INA
-Adafruit_INA228 INA1; // Alternator
+Adafruit_INA228 INA1; // Supply
 Adafruit_INA228 INA2; // Battery
 
 // Thermistor
@@ -50,12 +65,12 @@ DallasTemperature thermistor1(&oneWire1);
 // Servo
 Servo servo; // Servo instance
 
-bool readCsvMode = false; // Flag to determine whether to read CSV or sensors
-String cmdBuffer = "";
+bool readCsvMode = false; // Flag to determine whether to read local data saved to ESP 32 or live sensor data
+String cmdBuffer = ""; // For serial commands
 
 unsigned long startTime; // Global variable to store the starting time
 
-volatile bool isPaused = true; // Interrupt status
+volatile bool isPaused = false; // Interrupt status (set to true to avoid immediate data flooding)
 
 // Keep track of timing of recent interrupts
 volatile unsigned long button_time = 0;
@@ -96,21 +111,19 @@ void setup_display() {
   // tft.fillScreen(TFT_BLACK);
 
   pinMode(GPIO_0, INPUT_PULLUP); // GPIO 0
-  // pinMode(GPIO_35, INPUT_PULLUP); // GPIO 35
   attachInterrupt(GPIO_0, isr, FALLING);
-  // attachInterrupt(GPIO_35, isr, FALLING);
 }
 
-// MQTT callback function
+// MQTT callback function. This is how MQTT topics are subscribed to and the corresponding data is processed.
 void callback(char *topic, byte *payload, unsigned int length) {
   Serial.print("Message arrived in topic: ");
-  Serial.println(topic);
+  Serial.println(topic); // Subscribed to topic
   
-  // Parse JSON
+  // Parse JSON (if expected data from the subscribed to topic is in JSON format)
   DynamicJsonDocument doc(256);
   deserializeJson(doc, payload, length);
   
-  // Extract servoPos
+  // Extract servoPos for this example
   int servoPos = doc["servoPos"];
 
   // Set servo position
@@ -153,7 +166,7 @@ void setup_wifi() {
 // Setup MQTT connection
 void setup_mqtt() {
   client.setServer(mqtt_broker, mqtt_port);
-  client.setCallback(callback);
+  client.setCallback(callback); 
   
   while (!client.connected()) {
     String client_id = "esp32-client-";
@@ -188,7 +201,7 @@ void setup_mqtt() {
   }
 }
 
-// Reconnect to MQTT
+// Reconnect to MQTT when connection fails
 void reconnect() {
   while (!client.connected()) {
     Serial.print("Reconnecting to MQTT server...");
@@ -240,14 +253,14 @@ void setup_SPIFFS() {
   // tft.fillScreen(TFT_BLACK);
 }
 
-// Headers for csv
+// Headers for csv files
 void write_headers() {
   fs::File INA_file = SPIFFS.open("/INA.csv", FILE_WRITE);
   if(!INA_file) {
     Serial.println("Failed to open file for writing");
     return;
   }
-  INA_file.println("time(s),altVoltage(V),batVoltage(V)");
+  INA_file.println("time(s),supplyVoltage(V),batteryVoltage(V)");
   INA_file.close();
 
   fs::File therm_file = SPIFFS.open("/therm.csv", FILE_WRITE);
@@ -255,7 +268,7 @@ void write_headers() {
     Serial.println("Failed to open file for writing");
     return;
   }
-  therm_file.println("time(s),tempBat(F)");
+  therm_file.println("time(s),batteryTemp(F)");
   therm_file.close();
 }
 
@@ -286,12 +299,12 @@ void clear_memory(String sensor_type) {
 void setup_INA() {
   // INA1 with address 0x40 (A0 = GND, A1 = GND)
   if (!INA1.begin(0x40)) {
-      Serial.println("Alternator INA not found, check wiring, address, sensor ID!");
+      Serial.println("Supply INA not found, check wiring, address, sensor ID!");
       while (1) delay(10);
   } 
 
-  // // INA2 with address 0x41 (A0 = VCC, A1 = GND)
-  // if (!INA2.begin(0x40)) {
+  // // INA2 with address 0x41 (A0 = VCC, A1 = GND) 
+  // if (!INA2.begin(0x41)) {
   //     Serial.println("Battery INA not found, check wiring, address, sensor ID!");
   //     while (1) delay(10);
   // }
@@ -302,7 +315,7 @@ void setup_INA() {
   INA1.setAveragingCount(INA228_COUNT_16);
   // INA2.setAveragingCount(INA228_COUNT_16);
 
-  Serial.println("Alternator INA found and initialized!");
+  Serial.println("INA(s) found and initialized!");
 }
 
 // Setup thermistors
@@ -324,16 +337,16 @@ void setup_therm() {
 
 // Setup servo
 void setup_servo() {
+  int pos;
+
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
   servo.setPeriodHertz(50);
   servo.attach(SERVO_PIN, 1000, 2000);
-  
-  // int initialPosition = 180; // Example initial position
-  // servo.write(initialPosition);
 
+  // Sweep to ensure servo is working
   for (pos = 0; pos <= 180; pos += 1) { // goes from 0 degrees to 180 degrees
 		// in steps of 1 degree
 		servo.write(pos);    // tell servo to go to position in variable 'pos'
@@ -368,12 +381,6 @@ void setup() {
   setup_SPIFFS();
 
   if (!readCsvMode) {
-    Serial.println("Clearing memory.");
-    // tft.setCursor(10, 10);
-    clear_memory("INA");
-    clear_memory("therm");
-
-    delay(2000);
     // tft.fillScreen(TFT_BLACK);
 
     write_headers();
@@ -390,7 +397,13 @@ void setup() {
     // tft.fillScreen(TFT_BLACK);
     // tft.setCursor(10, 10);
     // tft.println("Starting in paused mode...");
-    // tft.println("Press GPIO0 or GPIO35 to start.");
+    // tft.println("Press GPIO0 to start.");
+
+    Serial.println("Clearing memory.");
+    // tft.setCursor(10, 10);
+    clear_memory("INA");
+    clear_memory("therm");
+
     startTime = millis();
   } // else {
   //   tft.setCursor(10, 10);
@@ -402,10 +415,11 @@ void setup() {
 ////////////////////////////////////////////////////////////////////////////////////////Loop/////////////////////////////////////////////////////////////////////////////////////////////////
 // Read INA sensors
 void read_INA() {
-  // Read alternator voltage
-  float busVoltage1 = INA1.readBusVoltage() / 1000.0; 
-
-  // Initialize the battery voltage within 0.5 V of the alternator's voltage on first run
+  float busVoltage1 = INA1.readBusVoltage() / 1000.0; // Read supply voltage (V)
+  // float busVoltage2 = INA2.readBusVoltage() / 1000.0; // Read battery voltage (V)
+  
+  // IF ONLY USING ONE VOLTAGE SENSOR
+  // Initialize the battery voltage within 0.5 V of the supply's voltage on first run
   if (firstRun) {
     busVoltage2 = busVoltage1 + random(-5, 6) / 10.0; // Random initial difference between -0.5 and +0.5 V
     firstRun = false; // Set the flag to false after initialization
@@ -415,16 +429,16 @@ void read_INA() {
   float voltageDifference = busVoltage1 - busVoltage2;
 
   // Determine how much to adjust the battery voltage based on the voltage difference
-  // The adjustment factor determines how responsive the battery voltage is to changes in alternator voltage
-  float adjustmentFactor = 0.02; // Adjust this factor for more or less responsiveness
+  // The adjustment factor determines how responsive the battery voltage is to changes in suppy voltage
+  float adjustmentFactor = 0.007; // Adjust this factor for more or less responsiveness (higher means more resonsive)
   float adjustment = adjustmentFactor * voltageDifference;
 
-  // Adjust the battery voltage, ensuring it remains within the specified range and within ±1 V of the alternator voltage
+  // Adjust the battery voltage, ensuring it remains within the specified range and within ±1 V of the supply voltage
   busVoltage2 += adjustment;
   busVoltage2 = constrain(busVoltage2, max(12.5, busVoltage1 - 1.0), min(14.4, busVoltage1 + 1.0));
 
   // Output the simulated voltages to the Serial Monitor
-  Serial.print("Alternator voltage: ");
+  Serial.print("Supply voltage: ");
   Serial.print(busVoltage1);
   Serial.println(" V");
 
@@ -536,23 +550,23 @@ void loop() {
         cmdBuffer += cmd;
         switch (cmdBuffer.charAt(0)) {
           case 'I':
-            read_csv("IMU");
+            read_csv("IMU"); // MPU 9250
             cmdBuffer = "";
             break;
           case 'B':
-            read_csv("BME");
+            read_csv("BME"); // BME 280
             cmdBuffer = "";
             break;
           case 'V':
-            read_csv("INA");
+            read_csv("INA"); // INA 228
             cmdBuffer = "";
             break;
           case 'H':
-            read_csv("hall");
+            read_csv("hall"); // Hall effect sensor
             cmdBuffer = "";
             break;
           case 'T':
-            read_csv("therm");
+            read_csv("therm"); // DS18B20
             cmdBuffer = "";
             break;
           default:
@@ -570,13 +584,14 @@ void loop() {
       if (!client.connected()) {
       reconnect();
     }
-    client.loop();
+    client.loop(); // Performs necessary MQTT callback protocols
 
     // tft.setCursor(10, 10);
     // tft.setTextColor(TFT_WHITE);
 
     read_INA();
     read_therm();
+    Serial.println("----------------------------------------");
 
     // tft.fillScreen(TFT_BLACK);
     }
